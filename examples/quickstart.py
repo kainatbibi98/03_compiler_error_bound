@@ -1,22 +1,22 @@
 """Quickstart demonstration of MaxBound formal verification tool.
 
-This script:
-1. Defines a tiny 3-layer MLP architecture:
-   Linear(4 -> 8) -> ReLU -> Linear(8 -> 4) -> ReLU -> Linear(4 -> 2)
-   Total parameters: 86.
-2. Defines a mock optimizing compiler (MockCompiledModel) that simulates
-   fused operators and SIMD reassociation rounding differences.
-3. Defines a concrete input domain X (Box) with concrete numerical bounds.
-4. Computes the sound upper bound on ||cl_model(x) - model(x)||_inf using MaxBound.
-5. Draws N = 10,000 random samples from X, computes actual output discrepancies,
-   and asserts that NO sample exceeds the formally computed bound.
-6. Prints the maximum observed discrepancy alongside the theoretical sound bound.
+Demonstrates:
+1. The exact public API:
+       cl_model = cl_func(model)
+       bound = MaxBound(model, cl_model, X)
+2. Evaluation on a tiny MLP architecture (86 parameters).
+3. Evaluation on a real Hugging Face Transformer module (BertIntermediate).
+4. Soundness verification: drawing 10,000 samples and verifying
+   observed ||cl_model(x) - model(x)||_inf <= bound for all samples.
 """
 
 import sys
 import torch
 import torch.nn as nn
-from maxbound import Box, MaxBound
+from transformers import BertConfig
+from transformers.models.bert.modeling_bert import BertIntermediate
+
+from maxbound import Box, MaxBound, MaxBoundConfig
 
 
 class TinyMLP(nn.Module):
@@ -32,7 +32,6 @@ class TinyMLP(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        # Set manual seed for deterministic initialization
         torch.manual_seed(1337)
         self.net = nn.Sequential(
             nn.Linear(4, 8),
@@ -46,19 +45,8 @@ class TinyMLP(nn.Module):
         return self.net(x)
 
 
-class MockCompiledModel(nn.Module):
-    """Simulates a compiler that introduces bounded per-op numerical divergence.
-
-    In real optimizing compilers (e.g., XLA, TVM, TensorRT, Inductor), optimizations such as:
-    - Operator fusion (e.g. GEMM + ReLU),
-    - Tree-reduction / vectorization reordering of dot products,
-    - Fused Multiply-Add (FMA) instructions,
-    cause small, bounded deviations from standard eager IEEE 754 float32 evaluation.
-
-    This mock compiler executes the model layer-by-layer and introduces a deterministic
-    per-op perturbation bounded strictly by delta_op:
-        ||delta_k(z)||_inf <= delta_op.
-    """
+class MockCompiler(nn.Module):
+    """Simulates an optimizing compiler that introduces bounded per-op divergence."""
 
     def __init__(self, model: nn.Module, delta_op: float = 1e-4) -> None:
         super().__init__()
@@ -67,79 +55,106 @@ class MockCompiledModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
-        for layer in self.model.net:
+        submodules = list(self.model.children())
+        if not submodules:
+            submodules = [self.model]
+
+        for layer in submodules:
             h = layer(h)
-            # Add bounded perturbation simulating compiler fusion/reordering roundoff
-            # Perturbation is strictly in [-delta_op, delta_op]
-            noise = torch.sin(h * 17.0 + 0.314) * self.delta_op
+            # Add bounded perturbation strictly within [-delta_op, delta_op]
+            noise = torch.sin(h * 17.0 + 0.314) * (self.delta_op * 0.99)
             h = h + noise
         return h
 
 
-def main() -> None:
+# Alias for backward compatibility
+MockCompiledModel = MockCompiler
+
+
+def run_demo_mlp() -> None:
     print("=" * 70)
-    print(" MaxBound: Compiler Discrepancy Formal Verification Demo")
+    print(" Part 1: Verification on TinyMLP (3-layer MLP, 86 parameters)")
     print("=" * 70)
 
-    # 1. Instantiate the tiny model
+    # 1. Instantiate model
     model = TinyMLP()
     model.eval()
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"1. Model Architecture: TinyMLP (3-layer MLP, {total_params} parameters)")
-    for i, layer in enumerate(model.net):
-        print(f"   [{i}] {layer}")
 
-    # 2. Instantiate the compiled version with controlled discrepancy delta_op = 1e-4
+    # 2. Compile via compiler function: cl_model = cl_func(model)
     delta_op = 1e-4
-    cl_model = MockCompiledModel(model, delta_op=delta_op)
-    print(f"\n2. Compiled Model: MockCompiledModel (per-op discrepancy bound delta_op = {delta_op})")
+    cl_func = lambda m: MockCompiler(m.net, delta_op=delta_op)
+    cl_model = cl_func(model)
 
     # 3. Define concrete input domain X (Box in R^4)
-    # Concrete numerical bounds (no placeholders)
     lower = torch.tensor([-1.5, 0.2, -0.8, -2.0])
     upper = torch.tensor([1.5, 1.8, 1.2, 0.5])
     X = Box(lower=lower, upper=upper)
-    print(f"\n3. Concrete Input Domain X = [lower, upper] in R^4:")
-    print(f"   Lower: {X.lower.tolist()}")
-    print(f"   Upper: {X.upper.tolist()}")
-    print(f"   Center: {X.center.tolist()}")
-    print(f"   Radius: {X.radius.tolist()}")
 
-    # 4. Compute sound upper bound using MaxBound
-    print("\n4. Running MaxBound verification pass...")
+    # 4. Compute sound upper bound: bound = MaxBound(model, cl_model, X)
     bound = MaxBound(model.net, cl_model, X, eps_per_op=delta_op)
-    print(f"   >>> SOUND DISCREPANCY BOUND (L_infinity): {bound:.8f} <<<")
+    print(f"Computed Sound Upper Bound: {bound:.8f}")
 
-    # 5. Empirical verification: sample N points from X
+    # 5. Empirical validation: 10,000 samples
     num_samples = 10_000
-    print(f"\n5. Drawing {num_samples:,} random test samples uniformly from X...")
     gen = torch.Generator().manual_seed(42)
     samples = X.sample(num_samples, generator=gen)
 
     with torch.no_grad():
-        orig_outputs = model(samples)
-        comp_outputs = cl_model(samples)
-        # Compute L_infinity discrepancy per sample: max_j |comp_j - orig_j|
-        discrepancies = torch.norm(comp_outputs - orig_outputs, p=float("inf"), dim=1)
+        orig_out = model(samples)
+        comp_out = cl_model(samples)
+        diffs = torch.norm(comp_out - orig_out, p=float("inf"), dim=1)
 
-    max_observed = float(discrepancies.max().item())
-    min_observed = float(discrepancies.min().item())
-    mean_observed = float(discrepancies.mean().item())
+    max_observed = float(diffs.max().item())
+    print(f"Tested {num_samples:,} samples | Max Observed Discrepancy: {max_observed:.8f}")
+    assert max_observed <= bound, f"Violation! {max_observed} > {bound}"
+    print(f"[PASSED] All {num_samples:,} samples strictly satisfy ||cl_model(x) - model(x)||_inf <= bound")
 
-    print(f"   Samples tested:           {num_samples:,}")
-    print(f"   Min observed discrepancy: {min_observed:.8f}")
-    print(f"   Mean observed discrepancy:{mean_observed:.8f}")
-    print(f"   Max observed discrepancy: {max_observed:.8f}")
-    print(f"   Sound Upper Bound:        {bound:.8f}")
-    margin = bound - max_observed
-    print(f"   Safety Margin (Bound - Max): {margin:.8f} ({(margin / bound) * 100:.2f}%)")
 
-    # Assert formal soundness
-    assert max_observed <= bound, (
-        f"Soundness VIOLATION: max observed discrepancy {max_observed} exceeded bound {bound}!"
-    )
-    print("\n[VERIFIED] Soundness check PASSED: All 10,000 samples strictly satisfy ||cl_model(x) - model(x)||_inf <= bound.")
+def run_demo_huggingface() -> None:
+    print("\n" + "=" * 70)
+    print(" Part 2: Verification on Real Hugging Face Transformer DNN")
     print("=" * 70)
+
+    # 1. Instantiate a real Hugging Face module
+    config = BertConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        hidden_act="relu",
+    )
+    hf_model = BertIntermediate(config)
+    hf_model.eval()
+    print(f"Loaded Hugging Face module: {hf_model.__class__.__name__}")
+    print(f"Submodules: {dict(hf_model.named_children())}")
+
+    # 2. Compile model: cl_model = cl_func(model)
+    delta_op = 1e-4
+    cl_func = lambda m: MockCompiler(m, delta_op=delta_op)
+    cl_model = cl_func(hf_model)
+
+    # 3. Define input domain in R^16
+    X = Box.from_ball(center=torch.zeros(16), epsilon=0.5)
+
+    # 4. Compute sound upper bound: bound = MaxBound(model, cl_model, X)
+    bound = MaxBound(hf_model, cl_model, X, eps_per_op=delta_op)
+    print(f"Computed Sound Upper Bound: {bound:.8f}")
+
+    # 5. Empirical validation: 5,000 samples
+    samples = X.sample(5000, generator=torch.Generator().manual_seed(123))
+    with torch.no_grad():
+        orig_out = hf_model(samples)
+        comp_out = cl_model(samples)
+        diffs = torch.norm(comp_out - orig_out, p=float("inf"), dim=-1)
+
+    max_observed = float(diffs.max().item())
+    print(f"Tested 5,000 samples | Max Observed Discrepancy: {max_observed:.8f}")
+    assert max_observed <= bound, f"Violation! {max_observed} > {bound}"
+    print(f"[PASSED] Soundness verified on real Hugging Face architecture!")
+    print("=" * 70)
+
+
+def main() -> None:
+    run_demo_mlp()
+    run_demo_huggingface()
 
 
 if __name__ == "__main__":

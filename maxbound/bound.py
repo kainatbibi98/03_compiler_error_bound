@@ -5,47 +5,51 @@ MaxBound propagates input intervals and error bounds through the computational g
 to compute a sound upper bound on ||cl_model(x) - model(x)||_inf for all x in X.
 """
 
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 
 from maxbound.box import Box
+from maxbound.config import MaxBoundConfig
 from maxbound.propagate import (
+    propagate_dropout,
+    propagate_gelu,
     propagate_layernorm,
     propagate_linear,
     propagate_relu,
 )
 
+# Supported elementary leaf layer types
+SUPPORTED_LEAF_TYPES = (nn.Linear, nn.ReLU, nn.GELU, nn.LayerNorm, nn.Dropout)
+
 
 def extract_ordered_layers(model: nn.Module) -> List[nn.Module]:
-    """Extract a flat list of executable layers in forward order.
+    """Recursively extract executable elementary layers in forward execution order.
 
     Supports:
     - nn.Sequential
-    - Modules with sequential child submodules (Linear, ReLU, LayerNorm)
+    - Hugging Face submodules (e.g. BertIntermediate, BertOutput, classifier heads)
+    - Custom PyTorch container modules composed of elementary ops.
+
+    Returns:
+        List of elementary nn.Module layers.
 
     Raises:
-        ValueError: If model structure contains unsupported branching or unknown modules.
+        ValueError: If model cannot be decomposed or contains no executable layers.
     """
-    if isinstance(model, nn.Sequential):
-        return list(model)
+    if isinstance(model, SUPPORTED_LEAF_TYPES):
+        return [model]
 
     children = list(model.children())
-    if children and not any(isinstance(c, (nn.Sequential, nn.ModuleList)) for c in children):
-        # Flat module containing ordered layers
-        return children
+    if not children:
+        return [model]
 
-    # Try unpacking submodules recursively if strictly linear sequence
     flat_layers: List[nn.Module] = []
     for child in children:
-        if isinstance(child, (nn.Sequential, nn.ModuleList)):
-            flat_layers.extend(list(child))
-        else:
-            flat_layers.append(child)
+        flat_layers.extend(extract_ordered_layers(child))
 
-    if not flat_layers and isinstance(model, nn.Module):
-        # Single op module (e.g. nn.Linear directly)
-        return [model]
+    if not flat_layers:
+        raise ValueError(f"Could not extract any executable layers from {model}")
 
     return flat_layers
 
@@ -56,7 +60,8 @@ def MaxBound(
     X: Box,
     eps_per_op: Optional[Union[float, Sequence[float]]] = None,
     layers: Optional[Sequence[nn.Module]] = None,
-    base_eps: float = 1e-6,
+    base_eps: Optional[float] = None,
+    config: Optional[Union[MaxBoundConfig, Dict[str, Any], str]] = None,
 ) -> float:
     """Compute a sound upper bound on ||cl_model(x) - model(x)||_inf over x in X.
 
@@ -75,7 +80,7 @@ def MaxBound(
         sup_{x in X} ||cl_model(x) - model(x)||_inf <= MaxBound(model, cl_model, X).
 
     Args:
-        model: Original PyTorch neural network module.
+        model: Original PyTorch / Hugging Face neural network module.
         cl_model: Compiled model (torch.compile or mock compiled function/module).
             If cl_model declares an attribute `eps_per_op` or `delta_op`, it is used
             as the per-op discrepancy bound unless overridden.
@@ -84,6 +89,7 @@ def MaxBound(
         layers: Optional explicit list of layers in forward execution order.
             Required if model uses non-sequential control flow or custom forward logic.
         base_eps: Base per-op numerical tolerance if eps_per_op is None (default: 1e-6).
+        config: Optional MaxBoundConfig, dictionary, or JSON path for data-driven configuration.
 
     Returns:
         Scalar float representing the sound discrepancy bound under L_infinity norm.
@@ -94,6 +100,21 @@ def MaxBound(
     """
     if not isinstance(X, Box):
         raise TypeError(f"Input domain X must be an instance of maxbound.Box, got {type(X)}")
+
+    # Parse data-driven configuration
+    cfg: MaxBoundConfig
+    if config is None:
+        cfg = MaxBoundConfig()
+    elif isinstance(config, MaxBoundConfig):
+        cfg = config
+    elif isinstance(config, dict):
+        cfg = MaxBoundConfig.from_dict(config)
+    elif isinstance(config, str):
+        cfg = MaxBoundConfig.from_json(config)
+    else:
+        raise TypeError(f"Invalid config type: {type(config)}")
+
+    effective_base_eps = base_eps if base_eps is not None else cfg.base_eps
 
     # Determine ordered layer sequence
     if layers is not None:
@@ -116,6 +137,11 @@ def MaxBound(
             single_delta = float(eps_per_op)
         else:
             per_op_deltas = [float(d) for d in eps_per_op]
+    elif cfg.eps_per_op is not None:
+        if isinstance(cfg.eps_per_op, (int, float)):
+            single_delta = float(cfg.eps_per_op)
+        else:
+            per_op_deltas = [float(d) for d in cfg.eps_per_op]
     elif hasattr(cl_model, "delta_op"):
         attr = getattr(cl_model, "delta_op")
         if isinstance(attr, (int, float)):
@@ -147,14 +173,21 @@ def MaxBound(
                 weight=layer.weight,
                 bias=layer.bias,
                 delta_op=op_delta,
-                base_eps=base_eps,
+                base_eps=effective_base_eps,
             )
         elif isinstance(layer, nn.ReLU):
             current_box, current_error = propagate_relu(
                 current_box,
                 error=current_error,
                 delta_op=op_delta,
-                base_eps=base_eps,
+                base_eps=effective_base_eps,
+            )
+        elif isinstance(layer, nn.GELU):
+            current_box, current_error = propagate_gelu(
+                current_box,
+                error=current_error,
+                delta_op=op_delta,
+                base_eps=effective_base_eps,
             )
         elif isinstance(layer, nn.LayerNorm):
             current_box, current_error = propagate_layernorm(
@@ -165,12 +198,18 @@ def MaxBound(
                 bias=layer.bias,
                 eps=layer.eps,
                 delta_op=op_delta,
-                base_eps=base_eps,
+                base_eps=effective_base_eps,
+            )
+        elif isinstance(layer, nn.Dropout):
+            current_box, current_error = propagate_dropout(
+                current_box,
+                error=current_error,
+                training=model.training,
             )
         else:
             raise ValueError(
                 f"Unsupported layer type '{type(layer).__name__}' at index {idx}. "
-                f"Supported layers: nn.Linear, nn.ReLU, nn.LayerNorm."
+                f"Supported layers: nn.Linear, nn.ReLU, nn.GELU, nn.LayerNorm, nn.Dropout."
             )
 
     return float(current_error)

@@ -1,12 +1,55 @@
 # MaxBound: Sound Upper Bound on Model-vs-Compiler Output Discrepancy
 
-`MaxBound` is a formal verification tool that computes a **provably sound upper bound** on the output discrepancy between a neural network model and its compiled numerical implementation over an input domain $X$:
+`MaxBound` is a formal verification tool that computes a **provably sound upper bound** on the output discrepancy between a neural network model (standard PyTorch DNN or Hugging Face module) and its compiled numerical implementation over an input domain $X$:
 
 $$\sup_{x \in X} \| \text{cl\_model}(x) - \text{model}(x) \|_\infty \le \text{MaxBound}(\text{model}, \text{cl\_model}, X)$$
 
 ---
 
-## 1. Problem Formulation & Critical Framing
+## 1. Quick Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/kainatbibi98/03_compiler_error_bound.git
+cd 03_compiler_error_bound
+
+# Install in editable mode
+pip install -e .
+```
+
+---
+
+## 2. Public API & Usage
+
+The required public API signature is:
+
+```python
+from maxbound import MaxBound, Box
+
+# 1. Define or load model (PyTorch or Hugging Face DNN)
+# 2. Compile model via compiler function
+cl_model = cl_func(model)
+
+# 3. Define input domain Box [lower, upper] or L_infinity ball
+X = Box.from_ball(center=torch.zeros(d), epsilon=1.0)
+
+# 4. Compute sound upper bound
+bound = MaxBound(model, cl_model, X)
+```
+
+### Parameter Reference
+
+| Name | Type | Description |
+|---|---|---|
+| `model` | `nn.Module` / Hugging Face DNN | The original neural network model or submodule. |
+| `cl_func` | `callable` | The compiler function: `cl_model = cl_func(model)`. |
+| `cl_model` | `Any` | The compiled numerical implementation of `model`. |
+| `X` | `Box` | Axis-aligned hyper-rectangle input domain $[l, u]$. |
+| `bound` | `float` | Provably sound upper bound on $\|\text{cl\_model}(x) - \text{model}(x)\|_\infty$ for all $x \in X$. |
+
+---
+
+## 3. Critical Framing: Model vs. Compiler Discrepancy
 
 This is **not** adversarial robustness verification (which bounds how much the output changes when the *input* is perturbed within a single fixed network). 
 
@@ -18,7 +61,7 @@ This is a **model-vs-compiled-version discrepancy bound**: `model` and `cl_model
 
 ---
 
-## 2. Chosen Norm
+## 4. Chosen Norm
 
 `MaxBound` uses the **$L_\infty$ norm** (Chebyshev / maximum component norm) consistently:
 
@@ -35,21 +78,19 @@ $$\|W\|_\infty = \sup_{v \neq 0} \frac{\|W v\|_\infty}{\|v\|_\infty} = \max_{1 \
 
 ---
 
-## 3. Exact Input-Domain Format: `Box`
+## 5. Input Domain Specification: `Box`
 
 The input domain $X$ is defined as an axis-aligned hyper-rectangle (box) in $\mathbb{R}^n$:
 
 $$X = \{x \in \mathbb{R}^n \mid \text{lower}_i \le x_i \le \text{upper}_i, \; \forall i \in \{1, \dots, n\}\}$$
 
-### Class Definition & API
 ```python
 from maxbound import Box
 
-# Direct construction with explicit lower and upper bounds:
+# Explicit bounds
 X = Box(lower=[-1.5, 0.2, -0.8], upper=[1.5, 1.8, 1.2])
 
-# Convenience constructor for an L_infinity ball of radius epsilon:
-# {x : ||x - center||_inf <= epsilon}
+# L_infinity ball: {x : ||x - center||_inf <= epsilon}
 X_ball = Box.from_ball(center=[0.0, 1.0, 0.0], epsilon=0.5)
 ```
 
@@ -60,7 +101,7 @@ If any $\text{lower}_i > \text{upper}_i$, or if any coordinate contains `NaN`, a
 
 ---
 
-## 4. Propagation Method per Op & Soundness Justifications
+## 6. Propagation Method per Op & Soundness Proofs
 
 At step $k$ with mathematical operation $f_k$ and incoming error $e_{k-1} \ge \|\tilde{x}_{k-1} - x_{k-1}\|_\infty$, the error updates inductively via the triangle inequality:
 
@@ -117,7 +158,7 @@ The deviations $(x_i - \mu(x)) \in [l_i - \mu_U, u_i - \mu_L]$.
 Since variance $\sigma^2(x) \ge 0$, the denominator satisfies $\sqrt{\sigma^2 + \epsilon_{\text{LN}}} \ge \sqrt{\epsilon_{\text{LN}}}$.  
 An upper bound on the variance is:
 $$\sigma_U^2 = \frac{1}{d} \sum_{i=1}^d \max((l_i - \mu_U)^2, (u_i - \mu_L)^2)$$
-The normalized coordinate $\hat{x}_i$ is bounded over the interval $[\hat{x}_{i, \min}, \hat{x}_{i, \max}]$. Applying affine scaling by $\gamma = \gamma^+ - \gamma^-$ yields sound output bounds $[y_{\text{lower}}, y_{\text{upper}}]$.
+Applying affine scaling by $\gamma = \gamma^+ - \gamma^-$ yields sound output bounds $[y_{\text{lower}}, y_{\text{upper}}]$.
 
 **Error Discrepancy Propagation Inequality (Lipschitz Constant):**  
 The Jacobian of LayerNorm is $J(x) = \frac{1}{\sqrt{\sigma^2 + \epsilon_{\text{LN}}}} \text{diag}(\gamma) P(x)$, where $P(x) = I - \frac{1}{d}\mathbf{1}\mathbf{1}^T - \frac{1}{d}\hat{x}\hat{x}^T$ is an orthogonal projection matrix whose eigenvalues lie in $[0, 1]$.  
@@ -131,19 +172,15 @@ $$\|\tilde{y} - y\|_\infty \le \left(\frac{\sqrt{d} \|\gamma\|_\infty}{\sqrt{\ep
 
 ---
 
-### (d) Compiler Per-Op Error Term $\delta_{\text{op}}$
-
-The local per-op compiler discrepancy accounts for IEEE 754 float32 unit roundoff $u = 2^{-24} \approx 5.96 \times 10^{-8}$, accumulation depth $n$, and base fusion tolerance:
-
-$$\delta_{\text{op}} = \epsilon_{\text{base}} + n \cdot u \cdot \max(\|l_{\text{out}}\|_\infty, \|u_{\text{out}}\|_\infty)$$
-
-Alternatively, an explicit per-op budget $\delta_{\text{op}}$ can be passed directly or queried from `cl_model.delta_op`.
+### (d) GELU Activation & Dropout
+- **GELU**: $|\frac{d}{dx} \text{GELU}(x)| \le 1.13$ for all $x \in \mathbb{R}$. Thus $L_{\text{GELU}} = 1.13$.
+- **Dropout (Eval mode)**: Identity mapping ($y = x$), leaving intervals and discrepancy invariant with $L_{\text{Dropout}} = 1.0$.
 
 ---
 
-## 5. Worked Tiny Example (Step-by-Step Hand Check)
+## 7. Worked Tiny Example (Step-by-Step Hand Check)
 
-This exact worked example matches `tests/test_propagation_hand_check.py::test_hand_checked_two_layer_mlp`.
+This matches `tests/test_propagation_hand_check.py::test_hand_checked_two_layer_mlp`.
 
 ### Architecture: 2-Layer MLP
 - **Layer 1 (Linear)**:
@@ -156,126 +193,74 @@ This exact worked example matches `tests/test_propagation_hand_check.py::test_ha
 ### Input Domain $X$:
 $$x_1 \in [-1.0, 1.0], \quad x_2 \in [2.0, 3.0], \quad e_0 = 0.0$$
 
----
-
-### Step 1: Layer 1 (Linear)
-**Interval Propagation:**
-- Output coordinate 1:
-  $$y_{1, \min} = 2.0 \times (-1.0) - 1.0 \times 3.0 + 0.5 = -2.0 - 3.0 + 0.5 = -4.5$$
-  $$y_{1, \max} = 2.0 \times (1.0) - 1.0 \times 2.0 + 0.5 = 2.0 - 2.0 + 0.5 = 0.5$$
-- Output coordinate 2:
-  $$y_{2, \min} = 0.5 \times (-1.0) + 1.5 \times 2.0 - 1.0 = -0.5 + 3.0 - 1.0 = 1.5$$
-  $$y_{2, \max} = 0.5 \times (1.0) + 1.5 \times 3.0 - 1.0 = 0.5 + 4.5 - 1.0 = 4.0$$
-  $$\text{Box}_1 = \left[ \begin{pmatrix} -4.5 \\ 1.5 \end{pmatrix}, \begin{pmatrix} 0.5 \\ 4.0 \end{pmatrix} \right]$$
-
-**Error Propagation:**
-- Induced matrix norm:
-  $$\|W_1\|_\infty = \max(|2.0| + |-1.0|, |0.5| + |1.5|) = \max(3.0, 2.0) = 3.0$$
-- Error update:
-  $$e_1 = \|W_1\|_\infty \cdot e_0 + \delta_1 = 3.0 \times 0.0 + 0.01 = \mathbf{0.01}$$
-
----
-
-### Step 2: Layer 2 (ReLU)
-**Interval Propagation:**
-$$\text{ReLU}([-4.5, 0.5]) = [0.0, 0.5], \quad \text{ReLU}([1.5, 4.0]) = [1.5, 4.0]$$
-$$\text{Box}_2 = \left[ \begin{pmatrix} 0.0 \\ 1.5 \end{pmatrix}, \begin{pmatrix} 0.5 \\ 4.0 \end{pmatrix} \right]$$
-
-**Error Propagation:**
-- Lipschitz constant: $L_{\text{ReLU}} = 1.0$.
-- Error update:
-  $$e_2 = L_{\text{ReLU}} \cdot e_1 + \delta_2 = 1.0 \times 0.01 + 0.005 = \mathbf{0.015}$$
-
----
-
-### Step 3: Layer 3 (Linear)
-**Interval Propagation:**
-- $z_1 \in [0.0, 0.5]$, $z_2 \in [1.5, 4.0]$.
-  $$y_{\text{out}, \min} = 1.0 \times 0.0 - 2.0 \times 4.0 + 0.2 = -7.8$$
-  $$y_{\text{out}, \max} = 1.0 \times 0.5 - 2.0 \times 1.5 + 0.2 = -2.3$$
-  $$\text{Box}_3 = [[-7.8], [-2.3]]$$
-
-**Error Propagation:**
-- Induced matrix norm:
-  $$\|W_2\|_\infty = |1.0| + |-2.0| = 3.0$$
-- Error update:
-  $$e_3 = \|W_2\|_\infty \cdot e_2 + \delta_3 = 3.0 \times 0.015 + 0.02 = 0.045 + 0.02 = \mathbf{0.065}$$
+### Step-by-Step Derivation:
+1. **Layer 1 (Linear)**:
+   - Interval: $y_1 \in [2(-1) - 1(3) + 0.5, 2(1) - 1(2) + 0.5] = [-4.5, 0.5]$.  
+     $y_2 \in [0.5(-1) + 1.5(2) - 1, 0.5(1) + 1.5(3) - 1] = [1.5, 4.0]$.
+   - Norm: $\|W_1\|_\infty = \max(|2| + |-1|, |0.5| + |1.5|) = 3.0$.
+   - Error: $e_1 = 3.0 \times 0.0 + 0.01 = \mathbf{0.01}$.
+2. **Layer 2 (ReLU)**:
+   - Interval: $\text{ReLU}([-4.5, 0.5]) = [0.0, 0.5]$, $\text{ReLU}([1.5, 4.0]) = [1.5, 4.0]$.
+   - Error: $e_2 = 1.0 \times 0.01 + 0.005 = \mathbf{0.015}$.
+3. **Layer 3 (Linear)**:
+   - Interval: $y_{\text{out}} \in [1(0) - 2(4) + 0.2, 1(0.5) - 2(1.5) + 0.2] = [-7.8, -2.3]$.
+   - Norm: $\|W_2\|_\infty = |1| + |-2| = 3.0$.
+   - Error: $e_3 = 3.0 \times 0.015 + 0.02 = 0.045 + 0.02 = \mathbf{0.065}$.
 
 $$\text{Final Discrepancy Bound: } \mathbf{0.065}$$
 
-Verified to exact floating-point precision in `tests/test_propagation_hand_check.py`.
+Verified to exact floating-point precision in unit tests.
 
 ---
 
-## 6. Assumptions and Scope Limits
+## 8. Assumptions and Scope Limits
 
-1. **Target Architecture (Tiny Models)**:
-   Target models are 2–3 layer MLPs or single blocks (a few hundred to a few thousand parameters).
+1. **Target Model Scope (Deliberate Reduction)**:
+   Target models are small networks (2–3 layer MLPs or single transformer blocks, e.g. `BertIntermediate`, `BertOutput`, or small sequence classifiers).
    
    *Why full-LLM verification is intractable:*  
-   Deep networks suffer from the "wrapping effect" and error cascading under interval arithmetic: error bounds multiply across layers by $\prod_{k=1}^K L_k$. In a 32-layer transformer, the product of Lipschitz constants can exceed $10^{15}$, producing astronomically loose over-approximations. Furthermore, quadratic self-attention has a large input dimension and non-convex bilinear interactions ($QK^T$) that cause interval bounds to explode. Restricting scope to shallow networks is a deliberate, mathematically sound requirement.
+   Deep networks suffer from the "wrapping effect" and exponential error cascading under interval arithmetic: error bounds multiply across layers by $\prod_{k=1}^K L_k$. In a 32-layer transformer, the product of Lipschitz constants can exceed $10^{15}$, producing astronomically loose over-approximations. Furthermore, quadratic self-attention has a large input dimension and non-convex bilinear interactions ($QK^T$) that cause interval bounds to explode. Restricting scope to shallow networks/submodules is a deliberate, mathematically sound requirement.
 
 2. **CPU-Only Execution**:
    All computations, interval propagations, and random sampling run on standard CPU using plain PyTorch. No CUDA or GPU runtime is needed.
 
-3. **Supported Operators**:
-   - `nn.Linear` (fully connected affine layers)
-   - `nn.ReLU` (rectified linear activation)
-   - `nn.LayerNorm` (layer normalization)
-
-4. **Compiler Mocking (`cl_model`) in Demo**:
+3. **Compiler Mocking (`cl_model`) in Demo**:
    On macOS CPU, standard `torch.compile(..., backend="inductor")` requires an external OpenMP runtime (`libomp` via Homebrew) for Apple Clang C++ kernel compilation, without which it falls back or fails. Furthermore, for tiny CPU networks, Inductor eager execution emits identical bitwise floating-point results without fusion. To demonstrate measurable, realistic compiler numerical divergence, we provide `MockCompiledModel`, which introduces controlled, bounded per-op perturbations simulating fused FMA and SIMD reassociation rounding differences.
 
 ---
 
-## 7. Quickstart
+## 9. Data-Driven Configuration: `MaxBoundConfig`
 
-Run the demonstration script:
+Configuration can be specified programmatically, via dictionary, or from a JSON file:
 
-```bash
-python examples/quickstart.py
-```
+```python
+from maxbound import MaxBoundConfig, MaxBound
 
-### Sample Output:
-```text
-======================================================================
- MaxBound: Compiler Discrepancy Formal Verification Demo
-======================================================================
-1. Model Architecture: TinyMLP (3-layer MLP, 86 parameters)
-   [0] Linear(in_features=4, out_features=8, bias=True)
-   [1] ReLU()
-   [2] Linear(in_features=8, out_features=4, bias=True)
-   [3] ReLU()
-   [4] Linear(in_features=4, out_features=2, bias=True)
+# From JSON file
+config = MaxBoundConfig.from_json("config.json")
 
-2. Compiled Model: MockCompiledModel (per-op discrepancy bound delta_op = 0.0001)
+# Or inline
+config = MaxBoundConfig(
+    norm="linf",
+    base_eps=1e-5,
+    eps_per_op=1e-4,
+    num_samples=2000,
+)
 
-3. Concrete Input Domain X = [lower, upper] in R^4:
-   Lower: [-1.5, 0.2, -0.8, -2.0]
-   Upper: [1.5, 1.8, 1.2, 0.5]
-   Center: [0.0, 1.0, 0.2, -0.75]
-   Radius: [1.5, 0.8, 1.0, 1.25]
-
-4. Running MaxBound verification pass...
-   >>> SOUND DISCREPANCY BOUND (L_infinity): 0.00051440 <<<
-
-5. Drawing 10,000 random test samples uniformly from X...
-   Samples tested:           10,000
-   Min observed discrepancy: 0.00000216
-   Mean observed discrepancy:0.00011480
-   Max observed discrepancy: 0.00026953
-   Sound Upper Bound:        0.00051440
-   Safety Margin (Bound - Max): 0.00024486 (47.60%)
-
-[VERIFIED] Soundness check PASSED: All 10,000 samples strictly satisfy ||cl_model(x) - model(x)||_inf <= bound.
-======================================================================
+bound = MaxBound(model, cl_model, X, config=config)
 ```
 
 ---
 
-## 8. Running Tests
+## 10. Running the Quickstart & Tests
 
-Run the full pytest suite (all 20 unit, hand-check, empirical sanity, and soundness stress tests):
+### Quickstart Demo
+```bash
+python examples/quickstart.py
+```
+
+### PyTest Suite
+Run the full test suite (21 tests covering unit bounds, hand-checks, empirical sampling, edge cases, and real Hugging Face modules):
 
 ```bash
 pytest tests/ -v

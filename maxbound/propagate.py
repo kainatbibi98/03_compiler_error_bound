@@ -324,3 +324,114 @@ def propagate_layernorm(
 
     out_error = float(lipschitz_ln * error + delta_op)
     return out_box, out_error
+
+
+def propagate_dropout(
+    box: Box,
+    error: float,
+    training: bool = False,
+) -> Tuple[Box, float]:
+    """Propagate interval bounds and error through Dropout in evaluation mode.
+
+    SOUNDNESS JUSTIFICATION:
+    ------------------------
+    In evaluation mode (training=False), Dropout is the mathematical identity function:
+        Dropout_eval(x) = x.
+    Therefore:
+        1. Reachable interval is identical: y_lower = box.lower, y_upper = box.upper.
+        2. Discrepancy is unchanged: ||Dropout(cl_x) - Dropout(x)||_inf = ||cl_x - x||_inf <= error.
+    Inequality:
+        ||cl_y - y||_inf <= 1.0 * error.
+
+    Args:
+        box: Input interval domain [lower, upper].
+        error: Incoming accumulated error bound.
+        training: Must be False (eval mode required for deterministic formal verification).
+
+    Returns:
+        Tuple of (output_box, output_error).
+    """
+    if training:
+        raise ValueError("Formal verification requires deterministic evaluation mode (training=False).")
+    return box.clone(), float(error)
+
+
+def propagate_gelu(
+    box: Box,
+    error: float,
+    delta_op: Optional[float] = None,
+    base_eps: float = 1e-6,
+) -> Tuple[Box, float]:
+    """Propagate interval bounds and error through GELU activation.
+
+    y = GELU(x) = x * Phi(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+
+    SOUNDNESS JUSTIFICATION:
+    ------------------------
+    1. Interval Bound Propagation:
+       GELU(t) has a global minimum at t* ~ -0.75179 with GELU(t*) ~ -0.1700407.
+       For t >= 0, GELU is strictly monotonically increasing.
+       For t in [l, u]:
+           If l >= 0: GELU(l) <= GELU(x) <= GELU(u).
+           If u <= 0 and u <= -0.75179: GELU(l) <= GELU(x) <= GELU(u).
+           In general:
+               y_min = min(GELU(l), GELU(u), -0.17005 if (l < 0 and u > -1.5) else min(GELU(l), GELU(u)))
+               y_max = max(GELU(l), GELU(u))
+       Inequality:
+           y_lower_i <= GELU(x)_i <= y_upper_i  for all components i.
+
+    2. Error Discrepancy Propagation (Lipschitz Bound under L_infinity):
+       The first derivative of GELU is d/dx GELU(x) = Phi(x) + x * phi(x).
+       The derivative achieves its maximum at x ~ 0.75 with value ~ 1.12873,
+       and its minimum at x ~ -1.3 with value ~ -0.09.
+       Therefore, for all x in R:
+           |d/dx GELU(x)| <= 1.13.
+       By the Mean Value Theorem, for all a, b in R:
+           |GELU(a) - GELU(b)| <= 1.13 * |a - b|.
+       Under the L_infinity norm:
+           ||GELU(cl_x) - GELU(x)||_inf <= 1.13 * ||cl_x - x||_inf <= 1.13 * error.
+       Accounting for local compiler rounding error delta_gelu with ||delta_gelu||_inf <= delta_op:
+           ||cl_y - y||_inf <= 1.13 * error + delta_op.
+       Inequality:
+           ||cl_y - y||_inf <= 1.13 * error + delta_op.
+
+    Args:
+        box: Input interval domain [lower, upper].
+        error: Incoming accumulated error bound e_in >= 0.
+        delta_op: Optional explicit per-op discrepancy bound.
+        base_eps: Base per-op tolerance if delta_op is None.
+
+    Returns:
+        Tuple of (output_box, output_error).
+    """
+    if error < 0:
+        raise ValueError(f"Incoming error must be non-negative, got {error}")
+
+    def gelu_fn(t: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.gelu(t)
+
+    gelu_l = gelu_fn(box.lower)
+    gelu_u = gelu_fn(box.upper)
+
+    # Global minimum guard: GELU achieves ~ -0.1700407 near -0.7518
+    min_cand = torch.minimum(gelu_l, gelu_u)
+    # Check where interval brackets the minimum: lower < 0 and upper > -1.5
+    bracket_min = (box.lower < 0.0) & (box.upper > -1.5)
+    global_min_tensor = torch.full_like(min_cand, fill_value=-0.17005)
+    out_lower = torch.where(bracket_min, torch.minimum(min_cand, global_min_tensor), min_cand)
+    out_upper = torch.maximum(gelu_l, gelu_u)
+
+    out_box = Box(out_lower, out_upper)
+
+    if delta_op is None:
+        delta_op = compute_default_delta_op(
+            out_box,
+            num_accumulations=1,
+            base_eps=base_eps,
+        )
+
+    # Sound Lipschitz constant: L_GELU = 1.13
+    out_error = float(1.13 * error + delta_op)
+    return out_box, out_error
+
+
