@@ -61,3 +61,4 @@ class MaxBoundConfig:
     def to_json(self, indent: int = 2) -> str:
         """Serialize configuration to formatted JSON string."""
         return json.dumps(self.to_dict(), indent=indent)
+
