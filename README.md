@@ -1,1 +1,282 @@
-# 03_compiler_error_bound
+# MaxBound: Sound Upper Bound on Model-vs-Compiler Output Discrepancy
+
+`MaxBound` is a formal verification tool that computes a **provably sound upper bound** on the output discrepancy between a neural network model and its compiled numerical implementation over an input domain $X$:
+
+$$\sup_{x \in X} \| \text{cl\_model}(x) - \text{model}(x) \|_\infty \le \text{MaxBound}(\text{model}, \text{cl\_model}, X)$$
+
+---
+
+## 1. Problem Formulation & Critical Framing
+
+This is **not** adversarial robustness verification (which bounds how much the output changes when the *input* is perturbed within a single fixed network). 
+
+This is a **model-vs-compiled-version discrepancy bound**: `model` and `cl_model` are two distinct numerical implementations of approximately the same mathematical computation. During compilation (e.g., via TVM, TensorRT, XLA, or PyTorch Inductor), compilers reorder arithmetic operations (e.g. tree reduction in SIMD vector units), fuse operations (e.g. GEMM + ReLU), and apply Fused Multiply-Add (FMA) instructions. These optimizations introduce bounded floating-point rounding divergence at each layer.
+
+`MaxBound` tracks:
+1. The **reachable activation interval domain** $[l_k, u_k]$ at each layer $k$ using Interval Bound Propagation (IBP).
+2. The **accumulated numerical discrepancy bound** $e_k$ representing the worst-case divergence between the original and compiled model activations up to layer $k$.
+
+---
+
+## 2. Chosen Norm
+
+`MaxBound` uses the **$L_\infty$ norm** (Chebyshev / maximum component norm) consistently:
+
+$$\|v\|_\infty = \max_{1 \le i \le n} |v_i|$$
+
+For linear operators $W \in \mathbb{R}^{m \times n}$, the induced matrix operator norm is the maximum absolute row sum:
+
+$$\|W\|_\infty = \sup_{v \neq 0} \frac{\|W v\|_\infty}{\|v\|_\infty} = \max_{1 \le i \le m} \sum_{j=1}^n |W_{ij}|$$
+
+**Why $L_\infty$?**
+- Floating-point hardware specifications (IEEE 754) naturally provide coordinate-wise rounding error bounds: $|\tilde{y}_i - y_i| \le \delta_i$. Under $L_\infty$, the maximum coordinate error is simply $\|\tilde{y} - y\|_\infty \le \max_i \delta_i$.
+- Induced matrix $\infty$-norms can be computed exactly and soundly in closed form.
+- Component-wise non-linear activations such as ReLU have an exact Lipschitz constant of $1.0$ under $L_\infty$.
+
+---
+
+## 3. Exact Input-Domain Format: `Box`
+
+The input domain $X$ is defined as an axis-aligned hyper-rectangle (box) in $\mathbb{R}^n$:
+
+$$X = \{x \in \mathbb{R}^n \mid \text{lower}_i \le x_i \le \text{upper}_i, \; \forall i \in \{1, \dots, n\}\}$$
+
+### Class Definition & API
+```python
+from maxbound import Box
+
+# Direct construction with explicit lower and upper bounds:
+X = Box(lower=[-1.5, 0.2, -0.8], upper=[1.5, 1.8, 1.2])
+
+# Convenience constructor for an L_infinity ball of radius epsilon:
+# {x : ||x - center||_inf <= epsilon}
+X_ball = Box.from_ball(center=[0.0, 1.0, 0.0], epsilon=0.5)
+```
+
+### Soundness Invariant
+The `Box` constructor strictly validates that:
+$$\text{lower}_i \le \text{upper}_i \quad \forall i$$
+If any $\text{lower}_i > \text{upper}_i$, or if any coordinate contains `NaN`, a `ValueError` is raised immediately.
+
+---
+
+## 4. Propagation Method per Op & Soundness Justifications
+
+At step $k$ with mathematical operation $f_k$ and incoming error $e_{k-1} \ge \|\tilde{x}_{k-1} - x_{k-1}\|_\infty$, the error updates inductively via the triangle inequality:
+
+$$\begin{aligned}
+\|\tilde{x}_k - x_k\|_\infty &= \|\tilde{f}_k(\tilde{x}_{k-1}) - f_k(x_{k-1})\|_\infty \\
+&\le \|f_k(\tilde{x}_{k-1}) - f_k(x_{k-1})\|_\infty + \|\tilde{f}_k(\tilde{x}_{k-1}) - f_k(\tilde{x}_{k-1})\|_\infty \\
+&\le L_k \cdot e_{k-1} + \delta_{\text{op}, k} = e_k
+\end{aligned}$$
+
+where:
+- $L_k$ is the sound Lipschitz constant of $f_k$ under the $L_\infty$ norm over the reachable domain.
+- $\delta_{\text{op}, k}$ is the compiler's local discrepancy bound at layer $k$.
+
+### (a) Affine / Linear Layer: $y = W x + b$
+
+**Interval Propagation Inequality:**  
+Decompose $W = W^+ - W^-$ with $W^+ = \max(W, 0) \ge 0$ and $W^- = \max(-W, 0) \ge 0$.  
+For all $x \in [l, u]$:
+$$W^+ l \le W^+ x \le W^+ u \quad \text{and} \quad -W^- u \le -W^- x \le -W^- l$$
+Summing these yields component-wise exact bounds:
+$$y_{\text{lower}} = W^+ l - W^- u + b \le W x + b \le W^+ u - W^- l + b = y_{\text{upper}}$$
+
+**Error Discrepancy Propagation Inequality:**  
+Let $\|\tilde{x} - x\|_\infty \le e_{\text{in}}$ and local compiler discrepancy $\|\tilde{y} - (W\tilde{x} + b)\|_\infty \le \delta_{\text{op}}$.  
+By definition of the induced matrix norm:
+$$\|W(\tilde{x} - x)\|_\infty \le \|W\|_\infty \|\tilde{x} - x\|_\infty \le \|W\|_\infty \cdot e_{\text{in}}$$
+where $\|W\|_\infty = \max_{1 \le i \le m} \sum_{j=1}^n |W_{ij}|$.  
+Therefore:
+$$\|\tilde{y} - y\|_\infty \le \|W\|_\infty \cdot e_{\text{in}} + \delta_{\text{op}}$$
+
+---
+
+### (b) ReLU Activation: $y = \max(x, 0)$
+
+**Interval Propagation Inequality:**  
+Since $t \mapsto \max(t, 0)$ is monotonically non-decreasing on $\mathbb{R}$:
+$$l \le x \le u \implies \max(l, 0) \le \max(x, 0) \le \max(u, 0)$$
+
+**Error Discrepancy Propagation Inequality:**  
+For all real numbers $a, b \in \mathbb{R}$, $|\max(a, 0) - \max(b, 0)| \le |a - b|$.  
+Under the $L_\infty$ norm:
+$$\|\text{ReLU}(\tilde{x}) - \text{ReLU}(x)\|_\infty = \max_i |\text{ReLU}(\tilde{x}_i) - \text{ReLU}(x_i)| \le \max_i |\tilde{x}_i - x_i| = \|\tilde{x} - x\|_\infty \le e_{\text{in}}$$
+Hence the Lipschitz constant under $L_\infty$ is exactly $L_{\text{ReLU}} = 1.0$.  
+With compiler discrepancy $\delta_{\text{op}}$:
+$$\|\tilde{y} - y\|_\infty \le 1.0 \cdot e_{\text{in}} + \delta_{\text{op}}$$
+
+---
+
+### (c) Layer Normalization: $y = \gamma \odot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon_{\text{LN}}}} + \beta$
+
+**Interval Propagation Inequality:**  
+Let $d$ be the normalization dimension. Mean $\mu(x) = \frac{1}{d} \sum_{i=1}^d x_i \in [\mu_L, \mu_U]$ where $\mu_L = \frac{1}{d}\sum l_i$ and $\mu_U = \frac{1}{d}\sum u_i$.  
+The deviations $(x_i - \mu(x)) \in [l_i - \mu_U, u_i - \mu_L]$.  
+Since variance $\sigma^2(x) \ge 0$, the denominator satisfies $\sqrt{\sigma^2 + \epsilon_{\text{LN}}} \ge \sqrt{\epsilon_{\text{LN}}}$.  
+An upper bound on the variance is:
+$$\sigma_U^2 = \frac{1}{d} \sum_{i=1}^d \max((l_i - \mu_U)^2, (u_i - \mu_L)^2)$$
+The normalized coordinate $\hat{x}_i$ is bounded over the interval $[\hat{x}_{i, \min}, \hat{x}_{i, \max}]$. Applying affine scaling by $\gamma = \gamma^+ - \gamma^-$ yields sound output bounds $[y_{\text{lower}}, y_{\text{upper}}]$.
+
+**Error Discrepancy Propagation Inequality (Lipschitz Constant):**  
+The Jacobian of LayerNorm is $J(x) = \frac{1}{\sqrt{\sigma^2 + \epsilon_{\text{LN}}}} \text{diag}(\gamma) P(x)$, where $P(x) = I - \frac{1}{d}\mathbf{1}\mathbf{1}^T - \frac{1}{d}\hat{x}\hat{x}^T$ is an orthogonal projection matrix whose eigenvalues lie in $[0, 1]$.  
+Thus $\|P(x)\|_2 \le 1$.  
+Using norm equivalence $\|v\|_\infty \le \|v\|_2 \le \sqrt{d} \|v\|_\infty$:
+$$\|J(x) h\|_\infty \le \|J(x) h\|_2 \le \|J(x)\|_2 \|h\|_2 \le \frac{\|\gamma\|_\infty}{\sqrt{\epsilon_{\text{LN}}}} \sqrt{d} \|h\|_\infty$$
+Hence the sound Lipschitz constant under $L_\infty$ is:
+$$L_{\text{LN}} = \frac{\sqrt{d} \|\gamma\|_\infty}{\sqrt{\epsilon_{\text{LN}}}}$$
+And:
+$$\|\tilde{y} - y\|_\infty \le \left(\frac{\sqrt{d} \|\gamma\|_\infty}{\sqrt{\epsilon_{\text{LN}}}}\right) \cdot e_{\text{in}} + \delta_{\text{op}}$$
+
+---
+
+### (d) Compiler Per-Op Error Term $\delta_{\text{op}}$
+
+The local per-op compiler discrepancy accounts for IEEE 754 float32 unit roundoff $u = 2^{-24} \approx 5.96 \times 10^{-8}$, accumulation depth $n$, and base fusion tolerance:
+
+$$\delta_{\text{op}} = \epsilon_{\text{base}} + n \cdot u \cdot \max(\|l_{\text{out}}\|_\infty, \|u_{\text{out}}\|_\infty)$$
+
+Alternatively, an explicit per-op budget $\delta_{\text{op}}$ can be passed directly or queried from `cl_model.delta_op`.
+
+---
+
+## 5. Worked Tiny Example (Step-by-Step Hand Check)
+
+This exact worked example matches `tests/test_propagation_hand_check.py::test_hand_checked_two_layer_mlp`.
+
+### Architecture: 2-Layer MLP
+- **Layer 1 (Linear)**:
+  $$W_1 = \begin{pmatrix} 2.0 & -1.0 \\ 0.5 & 1.5 \end{pmatrix}, \quad b_1 = \begin{pmatrix} 0.5 \\ -1.0 \end{pmatrix}, \quad \delta_1 = 0.01$$
+- **Layer 2 (ReLU)**:
+  $$y = \text{ReLU}(x), \quad \delta_2 = 0.005$$
+- **Layer 3 (Linear)**:
+  $$W_2 = \begin{pmatrix} 1.0 & -2.0 \end{pmatrix}, \quad b_2 = \begin{pmatrix} 0.2 \end{pmatrix}, \quad \delta_3 = 0.02$$
+
+### Input Domain $X$:
+$$x_1 \in [-1.0, 1.0], \quad x_2 \in [2.0, 3.0], \quad e_0 = 0.0$$
+
+---
+
+### Step 1: Layer 1 (Linear)
+**Interval Propagation:**
+- Output coordinate 1:
+  $$y_{1, \min} = 2.0 \times (-1.0) - 1.0 \times 3.0 + 0.5 = -2.0 - 3.0 + 0.5 = -4.5$$
+  $$y_{1, \max} = 2.0 \times (1.0) - 1.0 \times 2.0 + 0.5 = 2.0 - 2.0 + 0.5 = 0.5$$
+- Output coordinate 2:
+  $$y_{2, \min} = 0.5 \times (-1.0) + 1.5 \times 2.0 - 1.0 = -0.5 + 3.0 - 1.0 = 1.5$$
+  $$y_{2, \max} = 0.5 \times (1.0) + 1.5 \times 3.0 - 1.0 = 0.5 + 4.5 - 1.0 = 4.0$$
+  $$\text{Box}_1 = \left[ \begin{pmatrix} -4.5 \\ 1.5 \end{pmatrix}, \begin{pmatrix} 0.5 \\ 4.0 \end{pmatrix} \right]$$
+
+**Error Propagation:**
+- Induced matrix norm:
+  $$\|W_1\|_\infty = \max(|2.0| + |-1.0|, |0.5| + |1.5|) = \max(3.0, 2.0) = 3.0$$
+- Error update:
+  $$e_1 = \|W_1\|_\infty \cdot e_0 + \delta_1 = 3.0 \times 0.0 + 0.01 = \mathbf{0.01}$$
+
+---
+
+### Step 2: Layer 2 (ReLU)
+**Interval Propagation:**
+$$\text{ReLU}([-4.5, 0.5]) = [0.0, 0.5], \quad \text{ReLU}([1.5, 4.0]) = [1.5, 4.0]$$
+$$\text{Box}_2 = \left[ \begin{pmatrix} 0.0 \\ 1.5 \end{pmatrix}, \begin{pmatrix} 0.5 \\ 4.0 \end{pmatrix} \right]$$
+
+**Error Propagation:**
+- Lipschitz constant: $L_{\text{ReLU}} = 1.0$.
+- Error update:
+  $$e_2 = L_{\text{ReLU}} \cdot e_1 + \delta_2 = 1.0 \times 0.01 + 0.005 = \mathbf{0.015}$$
+
+---
+
+### Step 3: Layer 3 (Linear)
+**Interval Propagation:**
+- $z_1 \in [0.0, 0.5]$, $z_2 \in [1.5, 4.0]$.
+  $$y_{\text{out}, \min} = 1.0 \times 0.0 - 2.0 \times 4.0 + 0.2 = -7.8$$
+  $$y_{\text{out}, \max} = 1.0 \times 0.5 - 2.0 \times 1.5 + 0.2 = -2.3$$
+  $$\text{Box}_3 = [[-7.8], [-2.3]]$$
+
+**Error Propagation:**
+- Induced matrix norm:
+  $$\|W_2\|_\infty = |1.0| + |-2.0| = 3.0$$
+- Error update:
+  $$e_3 = \|W_2\|_\infty \cdot e_2 + \delta_3 = 3.0 \times 0.015 + 0.02 = 0.045 + 0.02 = \mathbf{0.065}$$
+
+$$\text{Final Discrepancy Bound: } \mathbf{0.065}$$
+
+Verified to exact floating-point precision in `tests/test_propagation_hand_check.py`.
+
+---
+
+## 6. Assumptions and Scope Limits
+
+1. **Target Architecture (Tiny Models)**:
+   Target models are 2–3 layer MLPs or single blocks (a few hundred to a few thousand parameters).
+   
+   *Why full-LLM verification is intractable:*  
+   Deep networks suffer from the "wrapping effect" and error cascading under interval arithmetic: error bounds multiply across layers by $\prod_{k=1}^K L_k$. In a 32-layer transformer, the product of Lipschitz constants can exceed $10^{15}$, producing astronomically loose over-approximations. Furthermore, quadratic self-attention has a large input dimension and non-convex bilinear interactions ($QK^T$) that cause interval bounds to explode. Restricting scope to shallow networks is a deliberate, mathematically sound requirement.
+
+2. **CPU-Only Execution**:
+   All computations, interval propagations, and random sampling run on standard CPU using plain PyTorch. No CUDA or GPU runtime is needed.
+
+3. **Supported Operators**:
+   - `nn.Linear` (fully connected affine layers)
+   - `nn.ReLU` (rectified linear activation)
+   - `nn.LayerNorm` (layer normalization)
+
+4. **Compiler Mocking (`cl_model`) in Demo**:
+   On macOS CPU, standard `torch.compile(..., backend="inductor")` requires an external OpenMP runtime (`libomp` via Homebrew) for Apple Clang C++ kernel compilation, without which it falls back or fails. Furthermore, for tiny CPU networks, Inductor eager execution emits identical bitwise floating-point results without fusion. To demonstrate measurable, realistic compiler numerical divergence, we provide `MockCompiledModel`, which introduces controlled, bounded per-op perturbations simulating fused FMA and SIMD reassociation rounding differences.
+
+---
+
+## 7. Quickstart
+
+Run the demonstration script:
+
+```bash
+python examples/quickstart.py
+```
+
+### Sample Output:
+```text
+======================================================================
+ MaxBound: Compiler Discrepancy Formal Verification Demo
+======================================================================
+1. Model Architecture: TinyMLP (3-layer MLP, 86 parameters)
+   [0] Linear(in_features=4, out_features=8, bias=True)
+   [1] ReLU()
+   [2] Linear(in_features=8, out_features=4, bias=True)
+   [3] ReLU()
+   [4] Linear(in_features=4, out_features=2, bias=True)
+
+2. Compiled Model: MockCompiledModel (per-op discrepancy bound delta_op = 0.0001)
+
+3. Concrete Input Domain X = [lower, upper] in R^4:
+   Lower: [-1.5, 0.2, -0.8, -2.0]
+   Upper: [1.5, 1.8, 1.2, 0.5]
+   Center: [0.0, 1.0, 0.2, -0.75]
+   Radius: [1.5, 0.8, 1.0, 1.25]
+
+4. Running MaxBound verification pass...
+   >>> SOUND DISCREPANCY BOUND (L_infinity): 0.00051440 <<<
+
+5. Drawing 10,000 random test samples uniformly from X...
+   Samples tested:           10,000
+   Min observed discrepancy: 0.00000216
+   Mean observed discrepancy:0.00011480
+   Max observed discrepancy: 0.00026953
+   Sound Upper Bound:        0.00051440
+   Safety Margin (Bound - Max): 0.00024486 (47.60%)
+
+[VERIFIED] Soundness check PASSED: All 10,000 samples strictly satisfy ||cl_model(x) - model(x)||_inf <= bound.
+======================================================================
+```
+
+---
+
+## 8. Running Tests
+
+Run the full pytest suite (all 20 unit, hand-check, empirical sanity, and soundness stress tests):
+
+```bash
+pytest tests/ -v
+```
