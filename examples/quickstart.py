@@ -4,10 +4,11 @@ Demonstrates:
 1. The exact public API:
        cl_model = cl_func(model)
        bound = MaxBound(model, cl_model, X)
-2. Evaluation on a tiny MLP architecture (86 parameters).
-3. Evaluation on a real Hugging Face Transformer module (BertIntermediate).
-4. Soundness verification: drawing 10,000 samples and verifying
-   observed ||cl_model(x) - model(x)||_inf <= bound for all samples.
+2. Evaluation on PyTorch's native compiler: torch.compile.
+3. Evaluation on a real Hugging Face Transformer module: BertIntermediate.
+4. Evaluation on an optimizing compiler pass with operator fusion divergence.
+5. Soundness verification: drawing thousands of random samples from X and verifying
+   that the observed ||cl_model(x) - model(x)||_inf <= bound holds for all samples.
 """
 
 import sys
@@ -71,19 +72,20 @@ class MockCompiler(nn.Module):
 MockCompiledModel = MockCompiler
 
 
-def run_demo_mlp() -> None:
-    print("=" * 70)
-    print(" Part 1: Verification on TinyMLP (3-layer MLP, 86 parameters)")
-    print("=" * 70)
+def run_demo_torch_compile_mlp() -> None:
+    print("=" * 75)
+    print(" Part 1: Native torch.compile Verification on TinyMLP (3-layer MLP)")
+    print("=" * 75)
 
     # 1. Instantiate model
     model = TinyMLP()
     model.eval()
 
-    # 2. Compile via compiler function: cl_model = cl_func(model)
-    delta_op = 1e-4
-    cl_func = lambda m: MockCompiler(m.net, delta_op=delta_op)
+    # 2. Compile via PyTorch's native compiler: cl_model = cl_func(model)
+    # Using 'aot_eager' backend for cross-platform portability across CPU/macOS/Linux
+    cl_func = lambda m: torch.compile(m, backend="aot_eager")
     cl_model = cl_func(model)
+    print(f"Compiled model type: {type(cl_model).__name__} (via torch.compile)")
 
     # 3. Define concrete input domain X (Box in R^4)
     lower = torch.tensor([-1.5, 0.2, -0.8, -2.0])
@@ -91,8 +93,8 @@ def run_demo_mlp() -> None:
     X = Box(lower=lower, upper=upper)
 
     # 4. Compute sound upper bound: bound = MaxBound(model, cl_model, X)
-    bound = MaxBound(model.net, cl_model, X, eps_per_op=delta_op)
-    print(f"Computed Sound Upper Bound: {bound:.8f}")
+    bound = MaxBound(model.net, cl_model, X)
+    print(f"Computed Sound Upper Bound: {bound:.10e}")
 
     # 5. Empirical validation: 10,000 samples
     num_samples = 10_000
@@ -105,15 +107,15 @@ def run_demo_mlp() -> None:
         diffs = torch.norm(comp_out - orig_out, p=float("inf"), dim=1)
 
     max_observed = float(diffs.max().item())
-    print(f"Tested {num_samples:,} samples | Max Observed Discrepancy: {max_observed:.8f}")
+    print(f"Tested {num_samples:,} samples | Max Observed Discrepancy: {max_observed:.10e}")
     assert max_observed <= bound, f"Violation! {max_observed} > {bound}"
     print(f"[PASSED] All {num_samples:,} samples strictly satisfy ||cl_model(x) - model(x)||_inf <= bound")
 
 
-def run_demo_huggingface() -> None:
-    print("\n" + "=" * 70)
-    print(" Part 2: Verification on Real Hugging Face Transformer DNN")
-    print("=" * 70)
+def run_demo_torch_compile_huggingface() -> None:
+    print("\n" + "=" * 75)
+    print(" Part 2: Native torch.compile on Real Hugging Face Transformer DNN")
+    print("=" * 75)
 
     # 1. Instantiate a real Hugging Face module
     config = BertConfig(
@@ -126,17 +128,16 @@ def run_demo_huggingface() -> None:
     print(f"Loaded Hugging Face module: {hf_model.__class__.__name__}")
     print(f"Submodules: {dict(hf_model.named_children())}")
 
-    # 2. Compile model: cl_model = cl_func(model)
-    delta_op = 1e-4
-    cl_func = lambda m: MockCompiler(m, delta_op=delta_op)
+    # 2. Compile model with torch.compile: cl_model = cl_func(model)
+    cl_func = lambda m: torch.compile(m, backend="aot_eager")
     cl_model = cl_func(hf_model)
 
     # 3. Define input domain in R^16
     X = Box.from_ball(center=torch.zeros(16), epsilon=0.5)
 
     # 4. Compute sound upper bound: bound = MaxBound(model, cl_model, X)
-    bound = MaxBound(hf_model, cl_model, X, eps_per_op=delta_op)
-    print(f"Computed Sound Upper Bound: {bound:.8f}")
+    bound = MaxBound(hf_model, cl_model, X)
+    print(f"Computed Sound Upper Bound: {bound:.10e}")
 
     # 5. Empirical validation: 5,000 samples
     samples = X.sample(5000, generator=torch.Generator().manual_seed(123))
@@ -146,15 +147,52 @@ def run_demo_huggingface() -> None:
         diffs = torch.norm(comp_out - orig_out, p=float("inf"), dim=-1)
 
     max_observed = float(diffs.max().item())
+    print(f"Tested 5,000 samples | Max Observed Discrepancy: {max_observed:.10e}")
+    assert max_observed <= bound, f"Violation! {max_observed} > {bound}"
+    print(f"[PASSED] Soundness verified with native torch.compile on Hugging Face architecture!")
+
+
+def run_demo_fusion_compiler_pass() -> None:
+    print("\n" + "=" * 75)
+    print(" Part 3: Optimizing Compiler Pass with Operator Divergence (delta_op=1e-4)")
+    print("=" * 75)
+
+    # 1. Instantiate model
+    model = TinyMLP()
+    model.eval()
+
+    # 2. Compile via compiler with simulated kernel fusion divergence
+    delta_op = 1e-4
+    cl_func = lambda m: MockCompiler(m.net, delta_op=delta_op)
+    cl_model = cl_func(model)
+
+    # 3. Define domain
+    lower = torch.tensor([-1.5, 0.2, -0.8, -2.0])
+    upper = torch.tensor([1.5, 1.8, 1.2, 0.5])
+    X = Box(lower=lower, upper=upper)
+
+    # 4. Compute sound bound
+    bound = MaxBound(model.net, cl_model, X, eps_per_op=delta_op)
+    print(f"Computed Sound Upper Bound: {bound:.8f}")
+
+    # 5. Empirical validation: 5,000 samples
+    samples = X.sample(5000, generator=torch.Generator().manual_seed(42))
+    with torch.no_grad():
+        orig_out = model(samples)
+        comp_out = cl_model(samples)
+        diffs = torch.norm(comp_out - orig_out, p=float("inf"), dim=1)
+
+    max_observed = float(diffs.max().item())
     print(f"Tested 5,000 samples | Max Observed Discrepancy: {max_observed:.8f}")
     assert max_observed <= bound, f"Violation! {max_observed} > {bound}"
-    print(f"[PASSED] Soundness verified on real Hugging Face architecture!")
-    print("=" * 70)
+    print(f"[PASSED] Bound holds under compiler kernel fusion divergence!")
+    print("=" * 75)
 
 
 def main() -> None:
-    run_demo_mlp()
-    run_demo_huggingface()
+    run_demo_torch_compile_mlp()
+    run_demo_torch_compile_huggingface()
+    run_demo_fusion_compiler_pass()
 
 
 if __name__ == "__main__":

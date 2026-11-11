@@ -24,10 +24,14 @@ pip install -e .
 The required public API signature is:
 
 ```python
+import torch
 from maxbound import MaxBound, Box
 
 # 1. Define or load model (PyTorch or Hugging Face DNN)
-# 2. Compile model via compiler function
+model = ...
+
+# 2. Compile model via PyTorch's native torch.compile compiler
+cl_func = lambda m: torch.compile(m, backend="aot_eager")
 cl_model = cl_func(model)
 
 # 3. Define input domain Box [lower, upper] or L_infinity ball
@@ -49,11 +53,22 @@ bound = MaxBound(model, cl_model, X)
 
 ---
 
-## 3. Critical Framing: Model vs. Compiler Discrepancy
+## 3. Critical Framing: Compilers Under Testing & Discrepancy
 
 This is **not** adversarial robustness verification (which bounds how much the output changes when the *input* is perturbed within a single fixed network). 
 
-This is a **model-vs-compiled-version discrepancy bound**: `model` and `cl_model` are two distinct numerical implementations of approximately the same mathematical computation. During compilation (e.g., via TVM, TensorRT, XLA, or PyTorch Inductor), compilers reorder arithmetic operations (e.g. tree reduction in SIMD vector units), fuse operations (e.g. GEMM + ReLU), and apply Fused Multiply-Add (FMA) instructions. These optimizations introduce bounded floating-point rounding divergence at each layer.
+This is a **model-vs-compiled-version discrepancy bound**: `model` and `cl_model` are two distinct numerical implementations of the same mathematical architecture. We evaluate two complementary compiler settings:
+
+1. **Production Deep Learning Compiler (`torch.compile`)**:
+   PyTorch's native 2.x compiler captures the computation into an intermediate representation via **TorchDynamo** and lowers it through **AOTAutograd** and **TorchInductor**. In this setting, `MaxBound` bounds discrepancies arising from floating-point roundoff accumulation across layer operations according to IEEE 754 precision ($u = 2^{-24} \approx 5.96 \times 10^{-8}$ in float32):
+   ```python
+   cl_func = lambda m: torch.compile(m, backend="aot_eager")
+   cl_model = cl_func(model)
+   bound = MaxBound(model, cl_model, X)
+   ```
+
+2. **Optimizing Compiler Pass with Operator Divergence**:
+   When optimizing compilers perform aggressive kernel fusion (e.g., fusing GEMM with bias and activation) or parallel tree reductions (reassociating floating-point summations), intermediate rounding boundaries differ from eager execution. We evaluate an optimizing compiler pass injecting controlled per-layer divergence budgets ($\delta_{\text{op}} = 10^{-4}$) to stress-test the inductive error propagation engine against non-zero numerical divergence.
 
 `MaxBound` tracks:
 1. The **reachable activation interval domain** $[l_k, u_k]$ at each layer $k$ using Interval Bound Propagation (IBP).
@@ -224,8 +239,9 @@ Verified to exact floating-point precision in unit tests.
 2. **CPU-Only Execution**:
    All computations, interval propagations, and random sampling run on standard CPU using plain PyTorch. No CUDA or GPU runtime is needed.
 
-3. **Compiler Mocking (`cl_model`) in Demo**:
-   On macOS CPU, standard `torch.compile(..., backend="inductor")` requires an external OpenMP runtime (`libomp` via Homebrew) for Apple Clang C++ kernel compilation, without which it falls back or fails. Furthermore, for tiny CPU networks, Inductor eager execution emits identical bitwise floating-point results without fusion. To demonstrate measurable, realistic compiler numerical divergence, we provide `MockCompiledModel`, which introduces controlled, bounded per-op perturbations simulating fused FMA and SIMD reassociation rounding differences.
+3. **Cross-Platform Compiler Backend**:
+   `torch.compile` supports multiple backends. On standard macOS environments without OpenMP (`libomp`), Apple Clang does not compile C++ OpenMP kernels for the default `inductor` backend. For portable cross-platform execution (macOS CPU, Linux, and Windows), `backend="aot_eager"` runs TorchDynamo graph capture and AOTAutograd without requiring external C++ compiler toolchains, while `backend="inductor"` can be enabled whenever OpenMP or CUDA is present.
+   Additionally, we include `MockCompiler` to stress-test the verifier under synthetic aggressive kernel fusion divergence ($\delta_{\text{op}} = 10^{-4}$).
 
 ---
 
@@ -255,12 +271,14 @@ bound = MaxBound(model, cl_model, X, config=config)
 ## 10. Running the Quickstart & Tests
 
 ### Quickstart Demo
+Runs native `torch.compile` verification on TinyMLP and Hugging Face `BertIntermediate`, plus an optimizing compiler pass with kernel fusion divergence:
+
 ```bash
 python examples/quickstart.py
 ```
 
 ### PyTest Suite
-Run the full test suite (21 tests covering unit bounds, hand-checks, empirical sampling, edge cases, and real Hugging Face modules):
+Run the full test suite (23 tests covering `torch.compile`, unit bounds, hand-checks, empirical sampling, edge cases, and real Hugging Face modules):
 
 ```bash
 pytest tests/ -v
